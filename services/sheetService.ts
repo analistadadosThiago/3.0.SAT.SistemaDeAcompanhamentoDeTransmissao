@@ -1,0 +1,252 @@
+
+import { ReadingData, NotaData, SheetResponse, AppSection } from '../types';
+
+export const parseGoogleSheetUrl = (url: string): string | null => {
+  const match = url.match(/\/d\/([a-zA-Z0-9-_]+)/);
+  if (!match) return null;
+  const id = match[1];
+  
+  const gidMatch = url.match(/[#&]gid=([0-9]+)/);
+  const gid = gidMatch ? gidMatch[1] : '0';
+
+  return `https://docs.google.com/spreadsheets/d/${id}/export?format=csv&gid=${gid}`;
+};
+
+const normalizeHeader = (str: string): string => {
+  return str
+    .trim()
+    .toUpperCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "") 
+    .replace(/\s+/g, '_');
+};
+
+export const fetchSheetData = async (csvUrl: string, section: AppSection): Promise<SheetResponse> => {
+  const response = await fetch(csvUrl);
+  
+  if (!response.ok) {
+    throw new Error('Não foi possível acessar a planilha. Verifique o compartilhamento.');
+  }
+
+  const text = await response.text();
+  
+  if (text.trim().toLowerCase().startsWith('<!doctype html') || text.trim().toLowerCase().startsWith('<html')) {
+    throw new Error('Acesso negado: Certifique-se que a planilha está compartilhada como "Qualquer pessoa com o link" ou foi "Publicada na Web".');
+  }
+
+  const lines = text.split(/\r?\n/).filter(l => l.trim().length > 0);
+  if (lines.length < 1) throw new Error('A planilha está vazia.');
+
+  const firstLine = lines[0];
+  const commaCount = (firstLine.match(/,/g) || []).length;
+  const semicolonCount = (firstLine.match(/;/g) || []).length;
+  const delimiter = semicolonCount > commaCount ? ';' : ',';
+
+  // Extrair W1 da primeira linha (índice 22)
+  const firstLineCells = lines[0].split(delimiter);
+  const cellW1 = firstLineCells.length > 22 ? firstLineCells[22].trim() : null;
+
+  const rawHeaders = lines[0].split(delimiter).map(h => h.trim());
+  const normalizedHeaders = rawHeaders.map(normalizeHeader);
+  
+  // Extrair O1 da primeira linha (índice 14) se for consistência
+  let cellO1 = null;
+  if (section === 'consistencia') {
+    cellO1 = firstLineCells.length > 14 ? firstLineCells[14].trim() : null;
+  }
+
+  const transmissionMap: Record<string, string> = {
+    'MES': 'MES', 'ANO': 'ANO', 'CONTRATO': 'CONTRATO', 'BASE': 'BASE', 'CIDADE': 'CIDADE',
+    'UL': 'UL', 'RAZAO': 'RAZAO', 'RAZAO_SOCIAL': 'RAZAO', 'LOCAL': 'LOCAL', 'ROTA': 'ROTA', 'TIPO': 'TIPO',
+    'LEITURISTA': 'LEITURISTA', 'NOME_LEITURISTA': 'LEITURISTA',
+    'MATRICULA': 'MATRICULA', 'NOME_MATRICULA': 'NOME_MATRICULA',
+    'LEITURAS_A_REALIZAR': 'LEITURAS_A_REALIZAR', 'LEITURAS_100%': 'LEITURAS_100', 'LEITURAS_30%': 'LEITURAS_30',
+    'TELEMETRIA': 'TELEMETRIA', 'LEITURAS': 'LEITURAS', 'AUTO_RURAL': 'AUTO_RURAL',
+    'LEITURAS_NAO_REALIZADAS': 'LEITURAS_NAO_REALIZADAS', 'LEITURAS_N_REALIZADAS': 'LEITURAS_NAO_REALIZADAS',
+    'STATUS': 'STATUS'
+  };
+
+  const notasMap: Record<string, string> = {
+    'MES': 'MES', 'ANO': 'ANO', 'CONTRATO': 'CONTRATO', 'BASE': 'BASE', 'CIDADE': 'CIDADE',
+    'RAZAO': 'RAZAO', 'RAZAO_SOCIAL': 'RAZAO', 'TIPO': 'TIPO', 'LEITURISTA': 'LEITURISTA',
+    'NOME_LEITURISTA': 'LEITURISTA', 'NOTAS_GERADAS': 'NOTAS_GERADAS', 'NOTAS_CONCLUIDAS': 'NOTAS_CONCLUIDAS',
+    'NOTAS_CONCLUIDAS_': 'NOTAS_CONCLUIDAS', 'NOTAS_PENDENTES': 'NOTAS_PENDENTES', 'PRAZO_MEDIO': 'PRAZO_MEDIO',
+    'STATUS': 'STATUS', 'INSTALACAO': 'INSTALACAO', 'INSTALACAO_': 'INSTALACAO', 'UL': 'UL', 'UNIDADE_DE_LEITURA': 'UL',
+    'NOTA': 'NOTA', 'N_NOTA': 'NOTA', 'NOTAS': 'NOTA', 'PROCEDENCIA': 'PROCEDENCIA', 'PRAZO': 'PRAZO',
+    'DATA_DA_NOTA': 'DATA_DA_NOTA', 'DATA_NOTA': 'DATA_DA_NOTA', 'DATA_DA_EMISSAO': 'DATA_DA_NOTA'
+  };
+
+  const consistenciaMap: Record<string, string> = {
+    'MES': 'MES', 'ANO': 'ANO', 'CONTRATO': 'CONTRATO', 'BASE': 'BASE',
+    'QUANTIDADE_DE_CONSISTENCIA': 'LEITURAS_A_REALIZAR',
+    'QUANTIDADE_DE_REALIZADAS': 'LEITURAS_100',
+    'QUANTIDADE_DE_PENDENCIA': 'LEITURAS_NAO_REALIZADAS',
+    'STATUS': 'STATUS', 'PRAZO': 'PRAZO', 'RAZAO': 'RAZAO', 'RZ': 'RAZAO'
+  };
+
+  let headerMap = section === 'transmissao' ? transmissionMap : (section === 'consistencia' ? consistenciaMap : notasMap);
+
+  // Determinar o mês oficial do lote de transmissão com base na data do relatório (cellW1) ou na primeira linha válida
+  let transmissionBaseMonth = '';
+  if (section === 'transmissao') {
+    if (cellW1) {
+      const dateMatch = cellW1.match(/(\d{1,2})\/(\d{1,2})\/(\d{4})/);
+      if (dateMatch) {
+        const monthNum = parseInt(dateMatch[2], 10);
+        const monthNames = [
+          'Janeiro', 'Fevereiro', 'Março', 'Abril', 'Maio', 'Junho',
+          'Julho', 'Agosto', 'Setembro', 'Outubro', 'Novembro', 'Dezembro'
+        ];
+        if (monthNum >= 1 && monthNum <= 12) {
+          transmissionBaseMonth = monthNames[monthNum - 1];
+        }
+      }
+    }
+    if (!transmissionBaseMonth) {
+      for (let i = 1; i < lines.length; i++) {
+        const cells = lines[i].split(delimiter).map(v => v.trim());
+        if (cells[0] && cells[5] && cells[3]) {
+          transmissionBaseMonth = cells[0].charAt(0).toUpperCase() + cells[0].slice(1).toLowerCase();
+          break;
+        }
+      }
+    }
+  }
+
+  const data: any[] = [];
+  
+  for (let i = 1; i < lines.length; i++) {
+    const values = lines[i].split(delimiter).map(v => v.trim());
+    if (values.length < 3) continue;
+
+    const row: any = {};
+    normalizedHeaders.forEach((normHeader, index) => {
+      const targetKey = headerMap[normHeader] || normHeader;
+      const val = values[index];
+      const numericFields = [
+        'LEITURAS_A_REALIZAR', 'LEITURAS_100', 'LEITURAS_30', 'TELEMETRIA', 
+        'LEITURAS', 'AUTO_RURAL', 'LEITURAS_NAO_REALIZADAS', 'NOTAS_GERADAS', 
+        'NOTAS_CONCLUIDAS', 'NOTAS_PENDENTES', 'PRAZO_MEDIO'
+      ];
+
+      if (numericFields.includes(targetKey)) {
+        const cleanedVal = (val || '0').replace(/\./g, '').replace(',', '.');
+        row[targetKey] = parseFloat(cleanedVal) || 0;
+      } else {
+        row[targetKey] = val || '';
+      }
+    });
+
+    if (section === 'transmissao') {
+      // Ignorar linhas vazias da planilha onde não há UL nem Base nem Cidade
+      if (!row.UL && !row.BASE && !row.CIDADE) continue;
+
+      // Garantir que todas as rotas do lote pertençam ao mês oficial da base
+      if (transmissionBaseMonth) {
+        row.MES = transmissionBaseMonth;
+      } else if (row.MES) {
+        row.MES = row.MES.charAt(0).toUpperCase() + row.MES.slice(1).toLowerCase();
+      }
+    }
+
+    if (section === 'notas' || section === 'notas_triangulo' || section === 'notas_mantiqueira') {
+      if (!row.NOTA && !row.INSTALACAO && !row.RAZAO && !row.BASE) continue;
+      if (row.MES) {
+        row.MES = row.MES.charAt(0).toUpperCase() + row.MES.slice(1).toLowerCase();
+      }
+    }
+
+    if (section === 'consistencia') {
+      const ulIdx = normalizedHeaders.indexOf('UL');
+      const cidadeIdx = normalizedHeaders.indexOf('CIDADE');
+      const baseIdx = normalizedHeaders.lastIndexOf('BASE');
+      const contratoIdx = normalizedHeaders.indexOf('CONTRATO');
+
+      // Se for a aba DadosMatr (colunas identificadas pelos cabeçalhos)
+      if (ulIdx >= 0 && cidadeIdx >= 0 && baseIdx >= 0) {
+        const ulVal = values.length > ulIdx ? values[ulIdx].trim() : '';
+        const cidadeVal = values.length > cidadeIdx ? values[cidadeIdx].trim() : '';
+        const baseVal = values.length > baseIdx ? values[baseIdx].trim() : '';
+        const contratoVal = contratoIdx >= 0 && values.length > contratoIdx ? values[contratoIdx].trim() : '';
+        const rotaVal = values.length > 10 ? values[10].trim() : '';
+        const tipoVal = values.length > 11 ? values[11].trim() : '';
+
+        // Se a linha estiver vazia nos campos essenciais, ignorar
+        if (!ulVal && !baseVal && !cidadeVal) continue;
+
+        row.MES = '2026';
+        row.ANO = '2026';
+        row.RAZAO = rotaVal || tipoVal || '-';
+        row.UL = ulVal;
+        row.CIDADE = cidadeVal;
+        row.BASE = baseVal;
+        row.CONTRATO = contratoVal;
+        row.STATUS = 'Concluído';
+        row.PRAZO = tipoVal || 'No Prazo';
+        
+        row.CARD_A_REALIZAR = baseVal ? 1 : 0;
+        row.CARD_REALIZADAS = baseVal ? 1 : 0;
+        row.CARD_NAO_REALIZADAS = 0;
+        row.LEITURAS_30 = 0;
+      } else {
+        const valA = values.length > 0 ? values[0].trim() : ''; // Mês/Ano
+        const valC = values.length > 2 ? values[2].trim() : ''; // UL
+        const valD = values.length > 3 ? values[3].trim() : ''; // RZ
+        const valF = values.length > 5 ? values[5].trim() : ''; // Base
+        const valG = values.length > 6 ? values[6].trim() : ''; // Contrato
+        const valK = values.length > 10 ? values[10].trim() : ''; // Status
+        const valL = values.length > 11 ? values[11].trim() : ''; // Prazo
+        
+        // Tentar extrair Mês e Ano de valA (ex: "JANEIRO/2024" ou "01/2024")
+        let mes = valA;
+        let ano = '';
+        if (valA.includes('/')) {
+          [mes, ano] = valA.split('/');
+        } else if (valA.includes(' ')) {
+          [mes, ano] = valA.split(' ');
+        }
+
+        row.MES = mes.trim().toUpperCase();
+        row.ANO = ano.trim();
+        row.RAZAO = valD;
+        row.UL = valC;
+        row.BASE = valF;
+        row.CONTRATO = valG;
+        row.STATUS = valK;
+        row.PRAZO = valL;
+        
+        row.CARD_A_REALIZAR = valF ? 1 : 0;
+        row.CARD_REALIZADAS = (valF && valK.toUpperCase().includes('FINALIZADO') && !valK.toUpperCase().includes('N-FINALIZADO')) ? 1 : 0;
+        row.CARD_NAO_REALIZADAS = (valF && valK.toUpperCase().includes('N-FINALIZADO')) ? 1 : 0;
+        row.LEITURAS_30 = 0;
+      }
+    }
+
+    if (section === 'notas' || section === 'notas_triangulo' || section === 'notas_mantiqueira') {
+      // Geradas: contar a quantidade de registros (1 se a coluna E não estiver vazia)
+      const valE = values.length > 4 ? values[4].trim() : '';
+      row.NOTAS_GERADAS = valE.length > 0 ? 1 : 0;
+
+      // Se a coluna V (índice 21) existir, usamos ela como Status prioritário
+      const statusBruto = values.length > 21 ? values[21] : row.STATUS;
+      row.STATUS = statusBruto; // Atualiza o status para exibição na tabela também
+      
+      const statusNormalizado = (statusBruto || '').toString().trim().toUpperCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+      
+      if (statusNormalizado === 'OK' || statusNormalizado === 'CONCLUIDO' || statusNormalizado === 'CONCLUIDA') {
+        row.NOTAS_CONCLUIDAS = 1;
+        row.NOTAS_PENDENTES = 0;
+      } else if (statusNormalizado === 'N-OK' || statusNormalizado === 'PENDENTE') {
+        row.NOTAS_CONCLUIDAS = 0;
+        row.NOTAS_PENDENTES = 1;
+      } else {
+        row.NOTAS_CONCLUIDAS = 0;
+        row.NOTAS_PENDENTES = 0;
+      }
+    }
+
+    data.push(row);
+  }
+
+  return { data, lastUpdate: cellW1, cellO1: cellO1, cellC2: null, cellT1: null };
+};
